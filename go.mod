@@ -4,12 +4,14 @@ go 1.17
 
 require (
 	github.com/gempir/go-twitch-irc/v2 v2.7.0
+	github.com/nicklaw5/helix v1.25.0
 	github.com/spf13/viper v1.9.0
 	go.uber.org/zap v1.19.1
 )
 
 require (
 	github.com/fsnotify/fsnotify v1.5.1 // indirect
+	github.com/golang-jwt/jwt v3.2.1+incompatible // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/magiconair/properties v1.8.5 // indirect
 	github.com/mitchellh/mapstructure v1.4.2 // indirect
