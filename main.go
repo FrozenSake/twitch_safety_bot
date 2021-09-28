@@ -1,18 +1,24 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"io/ioutil"
+	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"os/signal"
 	"time"
 
 	"github.com/gempir/go-twitch-irc/v2"
+	"github.com/nicklaw5/helix"
 	"github.com/spf13/viper"
+
 	"go.uber.org/zap"
 )
 
@@ -28,31 +34,27 @@ type broadcaster struct {
 	connected bool
 }
 
-var CLIENT *twitch.Client
+var IRCCLIENT *twitch.Client
+var HELIXCLIENT *helix.Client
 
 var (
-	banLog     string
-	banList    string
-	banFilters string
-	newFilters string
+	banLog        string
+	banList       string
+	banFilters    string
+	newFilters    string
 	userWhitelist string
 )
 
 /*
 
-Read Files
-Create Files
+Use userid and block user
+	need to queue it up so we don't hit rate limits
+	channel?
 
-Connect to twitch IRC
-read user list in twitch
-consume channel events in twitch
 
-Call twitch web API
-get user id
-block user
-
-compare lists
-compare list against regex
+Setup local HTTP server as part of bot, for oauth and callbacks
+localhost/auth  --> handler for oauth2 flow
+ip:443/follow   --> handler for follow event webhook
 
 */
 
@@ -76,7 +78,7 @@ func ConnectedChannel(ch broadcaster) {
 
 func getAndCheckUserList(channelName string) {
 	zap.S().Debugf("##USERLIST FOR %v##\n", channelName)
-	userlist, err := CLIENT.Userlist(channelName)
+	userlist, err := IRCCLIENT.Userlist(channelName)
 	if err != nil {
 		zap.S().Errorf("Encountered error listing users: %v", err)
 		zap.S().Infof("Skipping to next channel")
@@ -87,22 +89,154 @@ func getAndCheckUserList(channelName string) {
 			continue
 		}
 		if checkIfNameFiltered(val) {
-			banMessage := fmt.Sprintf("/ban %s", val)
-			CLIENT.Say(channelName, banMessage)
-			if banLog != "" {
-				banLog = fmt.Sprintf("%s\n%s", banLog, val)
-			} else {
-				banLog = fmt.Sprintf("%s", val)
-			}
+			banUser(val, channelName)
 		} else {
-			zap.S().Infof("Whitelisting user %s for this stream.", val)
-			if userWhitelist != "" {
-				userWhitelist = fmt.Sprintf("%s\n%s", userWhitelist, val)
-			} else {
-				userWhitelist = fmt.Sprintf("%s", val)
-			}
+			whitelistUser(val)
 		}
 	}
+}
+
+func banUser(user string, channelName string) {
+	banMessage := fmt.Sprintf("/ban %s", user)
+	IRCCLIENT.Say(channelName, banMessage)
+	if banLog != "" {
+		banLog = fmt.Sprintf("%s\n%s", banLog, user)
+	} else {
+		banLog = fmt.Sprintf("%s", user)
+	}
+
+	// Get ID and Block User Codeblock
+	var names []string
+	names = append(names, user)
+	ids, err := getUserIDs(names)
+	if err != nil {
+		// Handle it
+	}
+	for _, id := range ids {
+		err := blockUser(id)
+		if err != nil {
+			// Handle it
+		}
+	}
+}
+
+func whitelistUser(user string) {
+	zap.S().Infof("Whitelisting user %s for this stream.", user)
+	if userWhitelist != "" {
+		userWhitelist = fmt.Sprintf("%s\n%s", userWhitelist, user)
+	} else {
+		userWhitelist = fmt.Sprintf("%s", user)
+	}
+}
+
+func getUserIDs(loginNames []string) ([]string, error) {
+	resp, err := HELIXCLIENT.GetUsers(&helix.UsersParams{
+		Logins: loginNames,
+	})
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("%v", resp)
+	var ids []string
+	for _, v := range resp.Data.Users {
+		ids = append(ids, v.ID)
+	}
+	return ids, nil
+}
+
+func blockUser(userID string) error {
+	resp, err := HELIXCLIENT.BlockUser(&helix.BlockUserParams{
+		TargetUserID:  fmt.Sprintf("%s", userID),
+		SourceContext: "chat",
+		Reason:        "Banned by Safety Bot for matching safety filters.",
+	})
+	if err != nil || resp.StatusCode != 204 {
+		zap.S().Errorf("Error blocking userID: %s", userID)
+		return err
+	}
+	zap.S().Infof("Blocked userID: %s", userID)
+	return nil
+}
+
+func subscribeToFollows(broadcasterID string) {
+	resp, err := HELIXCLIENT.CreateEventSubSubscription(&helix.EventSubSubscription{
+		Type:    helix.EventSubTypeChannelFollow,
+		Version: "1",
+		Condition: helix.EventSubCondition{
+			BroadcasterUserID: fmt.Sprintf("%s", broadcasterID),
+		},
+		Transport: helix.EventSubTransport{
+			Method:   "webhook",
+			Callback: fmt.Sprintf("https://%s/follow", "TODO"), //TODO
+			Secret:   fmt.Sprintf("%s", "TODO"),                //TODO
+		},
+	})
+	if err != nil {
+		// handle error
+	}
+
+	fmt.Printf("%+v\n", resp)
+}
+
+type eventSubNotification struct {
+	Subscription helix.EventSubSubscription `json:"subscription"`
+	Challenge    string                     `json:"challenge"`
+	Event        json.RawMessage            `json:"event"`
+}
+
+func eventsubFollow(w http.ResponseWriter, r *http.Request) {
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer r.Body.Close()
+	// verify that the notification came from twitch using the secret.
+	if !helix.VerifyEventSubNotification("s3cre7w0rd", r.Header, string(body)) {
+		log.Println("no valid signature on subscription")
+		return
+	} else {
+		log.Println("verified signature for subscription")
+	}
+	var vals eventSubNotification
+	err = json.NewDecoder(bytes.NewReader(body)).Decode(&vals)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	// if there's a challenge in the request, respond with only the challenge to verify your eventsub.
+	if vals.Challenge != "" {
+		w.Write([]byte(vals.Challenge))
+		return
+	}
+	var followEvent helix.EventSubChannelFollowEvent
+	err = json.NewDecoder(bytes.NewReader(vals.Event)).Decode(&followEvent)
+
+	log.Printf("got follow webhook: %s follows %s\n", followEvent.UserName, followEvent.BroadcasterUserName)
+	if checkIfNameFiltered(followEvent.UserName) {
+		banUser(followEvent.UserName, followEvent.BroadcasterUserName)
+	} else {
+		whitelistUser(followEvent.UserName)
+	}
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
+func unsubscribeFromFollows() {
+	client, err := helix.NewClient(&helix.Options{
+		ClientID:       "your-client-id",
+		AppAccessToken: "your-app-access-token",
+	})
+	if err != nil {
+		// handle error
+	}
+
+	resp, err := client.RemoveEventSubSubscription("subscription-id")
+	if err != nil {
+		// handle error
+	}
+
+	fmt.Printf("%+v\n", resp)
 }
 
 /* Name Parsing */
@@ -124,7 +258,7 @@ func checkIfNameFiltered(name string) bool {
 			continue
 		}
 		if filter[:1] != "^" {
-			zap.S().Infof("Adding ^ to filter: %s", filter)
+			//zap.S().Infof("Adding ^ to filter: %s", filter)
 			filter = fmt.Sprintf("^%s", filter)
 		}
 		re := regexp.MustCompile(filter)
@@ -148,6 +282,10 @@ func buildConfig() {
 	var oauth string
 	fmt.Scanln(&oauth)
 	viper.Set("oauth", oauth)
+	fmt.Println("Enter a comma separated list of channels for the bot to connect to: ")
+	var channels string
+	fmt.Scanln(&channels)
+	viper.Set("channels", channels)
 	viper.WriteConfig()
 	fmt.Println("Config file written to .env")
 }
@@ -222,6 +360,7 @@ func writeBans() {
 func main() {
 	sugar, _ := zap.NewDevelopment()
 	defer sugar.Sync()
+
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
@@ -231,13 +370,14 @@ func main() {
 		os.Exit(1)
 	}()
 	ticker := time.NewTicker(60 * time.Second)
+
 	userlistChan := make(chan struct{})
 	go func() {
 		for {
-		select {
-			case <- ticker.C:
+			select {
+			case <-ticker.C:
 				getAndCheckUserList("hikthur")
-			case <- userlistChan:
+			case <-userlistChan:
 				ticker.Stop()
 				return
 			}
@@ -271,7 +411,7 @@ func main() {
 	targets := strings.Split(channels, ",")
 	OauthCheck(oauth)
 	channelsStatus := make(map[string]broadcaster)
-	
+
 	// Define a regex object
 	filterre := regexp.MustCompile("^!FilterAdd (?P<filter>\\S*)")
 	banre := regexp.MustCompile("^!BanAdd (?P<ban>\\S*)")
@@ -281,39 +421,28 @@ func main() {
 	banLog = ""
 	newFilters = ""
 
-	zap.S().Infof("Creating Twitch Client: %v", username)
-	CLIENT = twitch.NewClient(username, oauth)
+	zap.S().Infof("Creating Twitch IRCCLIENT: %v", username)
+	IRCCLIENT = twitch.NewClient(username, oauth)
 
 	zap.S().Info("Prepare channels")
 	for _, channelName := range targets {
 		channelName = strings.ToLower(channelName)
 		zap.S().Infof("Joining channel %v", channelName)
-		CLIENT.Join(channelName)
+		IRCCLIENT.Join(channelName)
 
 		bc := broadcaster{name: channelName, connected: true}
 		channelsStatus[channelName] = bc
 	}
 
 	//TODO -> move banning to go channel
-	CLIENT.OnPrivateMessage(func(message twitch.PrivateMessage) {
+	IRCCLIENT.OnPrivateMessage(func(message twitch.PrivateMessage) {
 		zap.S().Infof("User %s joined the channel", message.User.Name)
 		if len(message.User.Badges) == 0 && !strings.Contains(userWhitelist, message.User.Name) {
 			zap.S().Info("No badges")
 			if checkIfNameFiltered(message.User.Name) {
-				banMessage := fmt.Sprintf("/ban %s", message.User.Name)
-				CLIENT.Say(message.Channel, banMessage)
-				if banLog != "" {
-					banLog = fmt.Sprintf("%s\n%s", banLog, message.User.Name)
-				} else {
-					banLog = fmt.Sprintf("%s", message.User.Name)
-				}
+				banUser(message.User.Name, message.Channel)
 			} else {
-				zap.S().Infof("Whitelisting user %s for this stream.", message.User.Name)
-				if userWhitelist != "" {
-					userWhitelist = fmt.Sprintf("%s\n%s", userWhitelist, message.User.Name)
-				} else {
-					userWhitelist = fmt.Sprintf("%s", message.User.Name)
-				}
+				whitelistUser(message.User.Name)
 			}
 		}
 		allowed := false
@@ -333,15 +462,9 @@ func main() {
 			target := message.Channel
 			matches := banre.FindStringSubmatch(message.Message)
 			banList = fmt.Sprintf("%s\n%s", banList, matches[1])
-			if banLog != "" {
-				banLog = fmt.Sprintf("%s\n%s", banLog, matches[1])
-			} else {
-				banLog = fmt.Sprintf("%s", matches[1])
-			}
+			banUser(matches[1], message.Channel)
 			commandMessage := fmt.Sprintf("Added %s to the banned users list.", matches[1])
-			CLIENT.Say(target, commandMessage)
-			banMessage := fmt.Sprintf("/ban %s", matches[1])
-			CLIENT.Say(target, banMessage)
+			IRCCLIENT.Say(target, commandMessage)
 		} else if filterre.MatchString(message.Message) {
 			target := message.Channel
 			matches := filterre.FindStringSubmatch(message.Message)
@@ -352,40 +475,28 @@ func main() {
 				newFilters = fmt.Sprintf("%s", matches[1])
 			}
 			commandMessage := fmt.Sprintf("Added %s to the filter list.", matches[1])
-			CLIENT.Say(target, commandMessage)
+			IRCCLIENT.Say(target, commandMessage)
 		}
 	})
 
 	//TODO -> move banning to ggo channel
-	CLIENT.OnUserStateMessage(func(message twitch.UserStateMessage) {
+	IRCCLIENT.OnUserStateMessage(func(message twitch.UserStateMessage) {
 		zap.S().Infof("User %s joined the channel", message.User.Name)
 		if message.User.Name != "" {
 			if checkIfNameFiltered(message.User.Name) {
-				banMessage := fmt.Sprintf("/ban %s", message.User.Name)
-				CLIENT.Say(message.Channel, banMessage)
-				if banLog != "" {
-					banLog = fmt.Sprintf("%s\n%s", banLog, message.User.Name)
-				} else {
-					banLog = fmt.Sprintf("%s", message.User.Name)
-				}
+				banUser(message.User.Name, message.Channel)
 			}
 		}
 		if message.User.DisplayName != "" {
 			if checkIfNameFiltered(message.User.DisplayName) {
-				banMessage := fmt.Sprintf("/ban %s", message.User.DisplayName)
-				CLIENT.Say(message.Channel, banMessage)
-				if banLog != "" {
-					banLog = fmt.Sprintf("%s\n%s", banLog, message.User.DisplayName)
-				} else {
-					banLog = fmt.Sprintf("%s", message.User.DisplayName)
-				}
+				banUser(message.User.DisplayName, message.Channel)
 			}
 		}
 	})
 
-	err := CLIENT.Connect()
+	err := IRCCLIENT.Connect()
 	if err != nil {
-		zap.S().Errorf("Error connecting twitch client: %v", err)
+		zap.S().Errorf("Error connecting twitch IRCCLIENT: %v", err)
 		panic(err)
 	}
 }
